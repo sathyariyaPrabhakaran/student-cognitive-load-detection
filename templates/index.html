@@ -1,9 +1,23 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cognitive Load Detection</title></head>
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Student Cognitive Load Detection</title>
+<style>
+body{font-family:Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 20px}button{padding:10px 16px;cursor:pointer}.card{border:1px solid #ddd;border-radius:12px;padding:20px;margin-top:20px}.value{font-size:32px;font-weight:700}.muted{color:#666}video{width:100%;max-width:640px;border-radius:12px;background:#111}
+</style></head>
 <body>
 <h1>Student Cognitive Load Detection</h1>
-<p>Use the <code>/predict</code> API with the project's behavioral features.</p>
-<p>Train the model first, then start Flask with <code>python app.py</code>.</p>
-</body>
-</html>
+<p class="muted">Multimodal behavioral and facial-feature based cognitive-load inference.</p>
+<div class="card">
+<h2>Live camera</h2><video id="video" autoplay muted playsinline></video><br><br>
+<button id="start">Start camera</button> <button id="stop">Stop camera</button>
+<p id="status" class="muted">Camera is off.</p>
+</div>
+<div class="card"><h2>Prediction API</h2><p>Use <code>POST /predict</code> with the trained model's feature schema. The server returns the predicted cognitive-load class and confidence.</p><div id="result" class="value">—</div></div>
+<script>
+const video=document.getElementById('video'),status=document.getElementById('status');let stream=null;
+document.getElementById('start').onclick=async()=>{try{stream=await navigator.mediaDevices.getUserMedia({video:true,audio:false});video.srcObject=stream;status.textContent='Camera active. Facial feature extraction can be connected to /predict.'}catch(e){status.textContent='Camera permission unavailable: '+e.message}};
+document.getElementById('stop').onclick=()=>{if(stream)stream.getTracks().forEach(t=>t.stop());video.srcObject=null;status.textContent='Camera is off.'};
+fetch('/health').then(r=>r.json()).then(x=>{document.getElementById('result').textContent=x.model_available?'Model ready':'Train model first'}).catch(()=>{});
+</script></body></html>
