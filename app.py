@@ -5,7 +5,8 @@ import joblib
 import pandas as pd
 from flask import Flask, jsonify, render_template, request
 
-from src.feature_engineering import engineer_features, get_feature_columns
+from src.swell_adapter import prepare_swell
+from src.temporal_features import add_session_dynamics, add_temporal_features
 
 ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "models" / "best_model.joblib"
@@ -13,14 +14,7 @@ RESULTS_DIR = ROOT / "results"
 FEATURE_PATH = ROOT / "models" / "feature_columns.joblib"
 METADATA_PATH = RESULTS_DIR / "run_metadata.json"
 COMPARISON_PATH = RESULTS_DIR / "model_comparison.csv"
-
 app = Flask(__name__)
-
-BASE_FEATURES = [
-    "ear", "mar", "blink_count", "yawn_count", "head_movement",
-    "typing_speed", "mouse_speed", "keyboard_idle", "mouse_idle",
-    "mouse_clicks", "study_time"
-]
 
 
 def load_model():
@@ -36,45 +30,36 @@ def read_json(path):
         return None
 
 
-def prediction_payload(frame, model):
-    engineered = engineer_features(frame.copy())
-    columns = get_feature_columns(include_derived=True)
-    missing = [c for c in columns if c not in engineered.columns]
+def prepare_for_model(frame):
+    model = load_model()
+    if model is None:
+        raise RuntimeError("No trained model. Run the SWELL setup and training pipeline first.")
+    feature_columns = joblib.load(FEATURE_PATH)
+    # Prediction input is expected to be already in the same raw feature schema as
+    # the downloaded SWELL behavioural table. Recreate the temporal transformations.
+    prepared, target, group_col = prepare_swell(frame.assign(condition="neutral"))
+    prepared = add_temporal_features(prepared, window=5, group_col=group_col)
+    prepared = add_session_dynamics(prepared)
+    X = prepared[[c for c in feature_columns if c in prepared.columns]].apply(pd.to_numeric, errors="coerce")
+    missing = [c for c in feature_columns if c not in X.columns]
     if missing:
-        raise ValueError(f"Missing features: {', '.join(missing)}")
+        raise ValueError(f"Input session is missing {len(missing)} trained features. Upload the SWELL behavioural feature schema.")
+    return model, X[feature_columns]
 
-    X = engineered[columns].apply(pd.to_numeric, errors="coerce")
-    if X.isna().all(axis=1).iloc[0]:
-        raise ValueError("At least one valid numeric input is required.")
 
-    prediction = str(model.predict(X)[0])
-    response = {"cognitive_load": prediction}
-
+def predict_frame(frame):
+    model, X = prepare_for_model(frame)
+    predictions = model.predict(X)
+    result = {"states": [str(v) for v in predictions]}
     if hasattr(model, "predict_proba"):
-        probs = model.predict_proba(X)[0]
+        probabilities = model.predict_proba(X)
         classes = [str(c) for c in model.classes_]
-        response["probabilities"] = {
-            label: round(float(prob), 4) for label, prob in zip(classes, probs)
-        }
-        response["confidence"] = round(float(max(probs)), 4)
-
-    # Transparent signal interpretation. These are feature signals, not causal explanations.
-    row = engineered.iloc[0]
-    signals = []
-    if float(row["idle_ratio"]) > 0.5:
-        signals.append({"name": "Idle behaviour", "direction": "elevated", "detail": "Keyboard/mouse inactivity is relatively high."})
-    if float(row["fatigue_proxy"]) > 1.0:
-        signals.append({"name": "Fatigue proxy", "direction": "elevated", "detail": "Yawning, head movement and idle behaviour combine to a higher fatigue signal."})
-    if float(row["activity_score"]) > 0:
-        signals.append({"name": "Interaction activity", "direction": "present", "detail": "Typing, mouse movement and clicks contribute to the behavioural profile."})
-    if float(row["engagement_proxy"]) > 0:
-        signals.append({"name": "Engagement proxy", "direction": "present", "detail": "Interaction and blink activity are included in the engineered feature set."})
-    response["signals"] = signals
-    response["engineered_features"] = {
-        c: round(float(row[c]), 4) if pd.notna(row[c]) else None
-        for c in columns if c not in BASE_FEATURES
-    }
-    return response
+        result["classes"] = classes
+        result["probabilities"] = [
+            {c: round(float(p), 4) for c, p in zip(classes, row)} for row in probabilities
+        ]
+        result["mean_confidence"] = round(float(probabilities.max(axis=1).mean()), 4)
+    return result
 
 
 @app.get("/")
@@ -87,31 +72,36 @@ def health():
     return jsonify({
         "status": "ok",
         "model_available": MODEL_PATH.exists(),
-        "dataset_available": (ROOT / "data" / "dataset.csv").exists(),
+        "dataset_available": (ROOT / "data" / "swell_kw_behavioral.tab").exists(),
         "evaluation_available": COMPARISON_PATH.exists(),
     })
 
 
 @app.get("/api/metadata")
 def metadata():
-    meta = read_json(METADATA_PATH)
     comparison = []
     if COMPARISON_PATH.exists():
         comparison = pd.read_csv(COMPARISON_PATH).fillna(0).to_dict(orient="records")
-    return jsonify({"metadata": meta, "comparison": comparison})
+    return jsonify({"metadata": read_json(METADATA_PATH), "comparison": comparison})
 
 
-@app.post("/predict")
-def predict():
+@app.post("/predict-session")
+def predict_session():
     model = load_model()
     if model is None:
-        return jsonify({"error": "No trained model is available. Add the dataset and run python src/train_models.py."}), 503
-
-    payload = request.get_json(silent=True) or request.form.to_dict()
-    frame = pd.DataFrame([payload])
+        return jsonify({"error": "No trained model is available. Run python scripts/setup_swell_kw.py and python src/train_models.py."}), 503
+    upload = request.files.get("file")
     try:
-        return jsonify(prediction_payload(frame, model))
-    except ValueError as exc:
+        if upload:
+            frame = pd.read_csv(upload, sep="\t")
+        else:
+            payload = request.get_json(silent=True) or {}
+            rows = payload.get("rows", payload if isinstance(payload, list) else [])
+            frame = pd.DataFrame(rows)
+        if frame.empty:
+            raise ValueError("Upload a non-empty SWELL-KW tab-delimited session file.")
+        return jsonify(predict_frame(frame))
+    except (ValueError, RuntimeError) as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"error": f"Prediction failed: {exc}"}), 500
