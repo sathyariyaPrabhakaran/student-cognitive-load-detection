@@ -41,7 +41,21 @@ def _archive_kind(path: Path) -> str | None:
     return None
 
 
+def _looks_like_excel_zip(path: Path) -> bool:
+    if _archive_kind(path) != "zip":
+        return False
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+        return "[Content_Types].xml" in names and "xl/workbook.xml" in names
+    except zipfile.BadZipFile:
+        return False
+
+
 def _extract_archive(path: Path) -> Path:
+    if _looks_like_excel_zip(path):
+        print("[SWELL] detected OOXML Excel workbook container")
+        return path
     kind = _archive_kind(path)
     if not kind:
         return path
@@ -50,24 +64,39 @@ def _extract_archive(path: Path) -> Path:
         with zipfile.ZipFile(path) as z:
             z.extractall(out_dir)
     elif kind == "gzip":
-        # A gzip member contains one file. Preserve a useful table suffix.
         out = out_dir / path.stem
         with gzip.open(path, "rb") as src, out.open("wb") as dst:
             dst.write(src.read())
     else:
         with tarfile.open(path) as t:
             t.extractall(out_dir, filter="data")
-
     candidates = [p for p in out_dir.rglob("*") if p.is_file()]
     if not candidates:
         raise ValueError(f"SWELL archive {path.name} contains no files.")
-    preferred = [p for p in candidates if p.suffix.lower() in {".tab", ".txt", ".csv", ".tsv"}]
+    preferred = [p for p in candidates if p.suffix.lower() in {".tab", ".txt", ".csv", ".tsv", ".xlsx", ".xls"}]
     candidates = preferred or candidates
-    # Prefer files whose names suggest behavioural/workload observations.
     candidates.sort(key=lambda p: (not any(k in p.name.lower() for k in ("behavior", "behaviour", "swell", "workload", "feature")), p.stat().st_size == 0, -p.stat().st_size))
     chosen = candidates[0]
     print(f"[SWELL] extracted archive -> {chosen.name}")
     return chosen
+
+
+def _read_excel_container(path: Path) -> pd.DataFrame:
+    try:
+        with zipfile.ZipFile(path) as z:
+            if "xl/workbook.xml" not in z.namelist():
+                raise ValueError("ZIP container is not an Excel workbook.")
+        df = pd.read_excel(path, engine="openpyxl")
+    except ImportError as exc:
+        raise ImportError("The SWELL workbook requires openpyxl. Run: python -m pip install openpyxl") from exc
+    except Exception as exc:
+        raise ValueError(f"The SWELL workbook could not be read as Excel: {exc}") from exc
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+    print(f"[SWELL] Excel sheet shape={df.shape}")
+    print(f"[SWELL] first columns={list(df.columns[:12])}")
+    if df.empty:
+        raise ValueError("The SWELL Excel workbook contains no data rows.")
+    return df
 
 
 def _read_tabular(path: Path) -> pd.DataFrame:
@@ -77,10 +106,7 @@ def _read_tabular(path: Path) -> pd.DataFrame:
     try:
         df = pd.read_csv(path, sep=separator, encoding=encoding, engine="python", on_bad_lines="warn")
     except (pd.errors.ParserError, UnicodeDecodeError) as exc:
-        raise ValueError(
-            f"The SWELL table could not be parsed. Detected encoding={encoding!r}, separator={separator!r}. "
-            f"The downloaded file may not be the behavioural feature table. Original error: {exc}"
-        ) from exc
+        raise ValueError(f"The SWELL table could not be parsed. Detected encoding={encoding!r}, separator={separator!r}. Original error: {exc}") from exc
     df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
     if df.empty:
         raise ValueError("The SWELL file was read successfully but contains no rows.")
@@ -94,6 +120,8 @@ def read_swell(path: str | Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"SWELL dataset not found: {path}")
     actual = _extract_archive(path)
+    if _looks_like_excel_zip(actual):
+        return _read_excel_container(actual)
     return _read_tabular(actual)
 
 
