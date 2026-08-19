@@ -2,6 +2,8 @@
 from __future__ import annotations
 from pathlib import Path
 import csv
+import gzip
+import zipfile
 import pandas as pd
 
 
@@ -25,20 +27,42 @@ def _detect_separator(path: Path, encoding: str) -> str:
         return max(counts, key=counts.get)
 
 
-def read_swell(path: str | Path) -> pd.DataFrame:
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"SWELL dataset not found: {path}")
+def _is_archive(path: Path) -> bool:
+    with path.open("rb") as f:
+        return f.read(4) in (b"PK\x03\x04", b"\x1f\x8b\x08\x00", b"\x1f\x8b\x08\x08")
+
+
+def _read_tabular(path: Path) -> pd.DataFrame:
+    """Read large/legacy SWELL tables without the C-engine buffer overflow."""
     encoding = _detect_encoding(path)
     separator = _detect_separator(path, encoding)
     print(f"[SWELL] encoding={encoding}, separator={separator!r}")
-    df = pd.read_csv(path, sep=separator, encoding=encoding, low_memory=False, on_bad_lines="warn")
+    try:
+        df = pd.read_csv(path, sep=separator, encoding=encoding, engine="python", on_bad_lines="warn")
+    except (pd.errors.ParserError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"The downloaded SWELL file could not be parsed as a normal text table. "
+            f"Detected encoding={encoding!r}, separator={separator!r}. "
+            f"This usually means the wrong SWELL file/archive was supplied. Original error: {exc}"
+        ) from exc
     df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
     if df.empty:
         raise ValueError("The SWELL file was read successfully but contains no rows.")
     print(f"[SWELL] shape={df.shape}")
     print(f"[SWELL] first columns={list(df.columns[:12])}")
     return df
+
+
+def read_swell(path: str | Path) -> pd.DataFrame:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"SWELL dataset not found: {path}")
+    if _is_archive(path):
+        raise ValueError(
+            f"{path.name} is an archive/compressed file, not a tabular dataset. "
+            "Extract the SWELL data file and point the training configuration to the extracted table."
+        )
+    return _read_tabular(path)
 
 
 def find_column(df: pd.DataFrame, names: list[str]) -> str | None:
