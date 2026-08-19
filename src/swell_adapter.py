@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import csv
 import gzip
+import tarfile
+import tempfile
 import zipfile
 import pandas as pd
 
@@ -27,13 +29,48 @@ def _detect_separator(path: Path, encoding: str) -> str:
         return max(counts, key=counts.get)
 
 
-def _is_archive(path: Path) -> bool:
+def _archive_kind(path: Path) -> str | None:
     with path.open("rb") as f:
-        return f.read(4) in (b"PK\x03\x04", b"\x1f\x8b\x08\x00", b"\x1f\x8b\x08\x08")
+        head = f.read(512)
+    if head.startswith(b"PK\x03\x04"):
+        return "zip"
+    if head.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if len(head) >= 262 and head[257:262] == b"ustar":
+        return "tar"
+    return None
+
+
+def _extract_archive(path: Path) -> Path:
+    kind = _archive_kind(path)
+    if not kind:
+        return path
+    out_dir = Path(tempfile.mkdtemp(prefix="swell_"))
+    if kind == "zip":
+        with zipfile.ZipFile(path) as z:
+            z.extractall(out_dir)
+    elif kind == "gzip":
+        # A gzip member contains one file. Preserve a useful table suffix.
+        out = out_dir / path.stem
+        with gzip.open(path, "rb") as src, out.open("wb") as dst:
+            dst.write(src.read())
+    else:
+        with tarfile.open(path) as t:
+            t.extractall(out_dir, filter="data")
+
+    candidates = [p for p in out_dir.rglob("*") if p.is_file()]
+    if not candidates:
+        raise ValueError(f"SWELL archive {path.name} contains no files.")
+    preferred = [p for p in candidates if p.suffix.lower() in {".tab", ".txt", ".csv", ".tsv"}]
+    candidates = preferred or candidates
+    # Prefer files whose names suggest behavioural/workload observations.
+    candidates.sort(key=lambda p: (not any(k in p.name.lower() for k in ("behavior", "behaviour", "swell", "workload", "feature")), p.stat().st_size == 0, -p.stat().st_size))
+    chosen = candidates[0]
+    print(f"[SWELL] extracted archive -> {chosen.name}")
+    return chosen
 
 
 def _read_tabular(path: Path) -> pd.DataFrame:
-    """Read large/legacy SWELL tables without the C-engine buffer overflow."""
     encoding = _detect_encoding(path)
     separator = _detect_separator(path, encoding)
     print(f"[SWELL] encoding={encoding}, separator={separator!r}")
@@ -41,9 +78,8 @@ def _read_tabular(path: Path) -> pd.DataFrame:
         df = pd.read_csv(path, sep=separator, encoding=encoding, engine="python", on_bad_lines="warn")
     except (pd.errors.ParserError, UnicodeDecodeError) as exc:
         raise ValueError(
-            f"The downloaded SWELL file could not be parsed as a normal text table. "
-            f"Detected encoding={encoding!r}, separator={separator!r}. "
-            f"This usually means the wrong SWELL file/archive was supplied. Original error: {exc}"
+            f"The SWELL table could not be parsed. Detected encoding={encoding!r}, separator={separator!r}. "
+            f"The downloaded file may not be the behavioural feature table. Original error: {exc}"
         ) from exc
     df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
     if df.empty:
@@ -57,12 +93,8 @@ def read_swell(path: str | Path) -> pd.DataFrame:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"SWELL dataset not found: {path}")
-    if _is_archive(path):
-        raise ValueError(
-            f"{path.name} is an archive/compressed file, not a tabular dataset. "
-            "Extract the SWELL data file and point the training configuration to the extracted table."
-        )
-    return _read_tabular(path)
+    actual = _extract_archive(path)
+    return _read_tabular(actual)
 
 
 def find_column(df: pd.DataFrame, names: list[str]) -> str | None:
