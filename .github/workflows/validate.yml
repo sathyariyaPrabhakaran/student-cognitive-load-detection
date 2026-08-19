@@ -1,0 +1,31 @@
+name: Validate Cognitive Load Project
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python modules
+        run: python -m compileall app.py src
+      - name: Validate Flask routes
+        run: |
+          python - <<'PY'
+          from app import app
+          routes = {rule.rule for rule in app.url_map.iter_rules()}
+          required = {'/', '/health', '/predict'}
+          missing = required - routes
+          if missing:
+              raise SystemExit(f'Missing routes: {sorted(missing)}')
+          print('Flask route validation passed')
+          PY
